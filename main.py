@@ -104,6 +104,18 @@ class NovaSolicitacaoEpi(BaseModel):
     itens: list[ItemEpiPedido]
 
 
+class NovoItemEpi(BaseModel):
+    codigo: str
+    descricao: str
+    umb: Optional[str] = "UN"
+    nomeConta: Optional[str] = ""
+    codigoConta: Optional[str] = ""
+    familia: Optional[str] = "GERAL"
+    deposito: Optional[str] = ""
+    custoUnitario: Optional[float] = 0
+    saldo: Optional[float] = 0
+
+
 class StatusEpiUpdate(BaseModel):
     status: str
 
@@ -118,6 +130,10 @@ class JanelaDia(BaseModel):
 
 class JanelaEpi(BaseModel):
     dias: list[JanelaDia]
+
+
+class TesteAbertoEpi(BaseModel):
+    ligado: bool
 
 
 @app.get("/api/epi/data")
@@ -150,7 +166,11 @@ def epi_get_all_data():
         for r in conn.execute(text("SELECT value FROM epi_config WHERE key='janela'")):
             janela = json.loads(r.value)
 
-    return {"setores": setores, "itens": itens, "solicitacoes": solicitacoes, "janela": janela}
+        teste_aberto = False
+        for r in conn.execute(text("SELECT value FROM epi_config WHERE key='testeAberto'")):
+            teste_aberto = r.value == "true"
+
+    return {"setores": setores, "itens": itens, "solicitacoes": solicitacoes, "janela": janela, "testeAberto": teste_aberto}
 
 
 @app.post("/api/epi/solicitacoes")
@@ -242,6 +262,18 @@ def epi_salvar_janela(body: JanelaEpi):
         ), {"v": json.dumps(body.dict())})
         if ok.rowcount == 0:
             conn.execute(text("INSERT INTO epi_config (key, value) VALUES ('janela', :v)"), {"v": json.dumps(body.dict())})
+    return {"ok": True}
+
+
+@app.put("/api/epi/config/teste")
+def epi_salvar_teste_aberto(body: TesteAbertoEpi):
+    with engine.begin() as conn:
+        valor = "true" if body.ligado else "false"
+        ok = conn.execute(text(
+            "UPDATE epi_config SET value = :v WHERE key = 'testeAberto'"
+        ), {"v": valor})
+        if ok.rowcount == 0:
+            conn.execute(text("INSERT INTO epi_config (key, value) VALUES ('testeAberto', :v)"), {"v": valor})
     return {"ok": True}
 
 
@@ -351,6 +383,18 @@ def epi_gerar_pdf(sol_id: str):
     return StreamingResponse(buf, media_type="application/pdf", headers={
         "Content-Disposition": f'inline; filename="solicitacao_{row.numero}.pdf"'
     })
+
+
+@app.post("/api/epi/itens")
+def epi_salvar_item(body: NovoItemEpi):
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO epi_itens (codigo, descricao, saldo, umb, nome_conta, codigo_conta, familia, deposito, custo_unitario) "
+            "VALUES (:codigo,:descricao,:saldo,:umb,:nomeConta,:codigoConta,:familia,:deposito,:custoUnitario) "
+            "ON CONFLICT (codigo) DO UPDATE SET descricao=:descricao, saldo=:saldo, umb=:umb, nome_conta=:nomeConta, "
+            "codigo_conta=:codigoConta, familia=:familia, deposito=:deposito, custo_unitario=:custoUnitario"
+        ), body.dict())
+    return {"ok": True}
 
 
 @app.post("/api/epi/itens/importar")
