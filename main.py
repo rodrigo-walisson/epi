@@ -6,7 +6,7 @@ import string
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
@@ -108,9 +108,16 @@ class StatusEpiUpdate(BaseModel):
     status: str
 
 
+class JanelaDia(BaseModel):
+    dia: int
+    horaInicio: int
+    minutoInicio: int = 0
+    horaFim: int
+    minutoFim: int = 0
+
+
 class JanelaEpi(BaseModel):
-    inicio: dict
-    fim: dict
+    dias: list[JanelaDia]
 
 
 @app.get("/api/epi/data")
@@ -135,7 +142,11 @@ def epi_get_all_data():
             row["itens"] = json.loads(row.pop("itens_json"))
             solicitacoes.append(row)
 
-        janela = {"inicio": {"dia": 1, "hora": 8, "minuto": 0}, "fim": {"dia": 3, "hora": 18, "minuto": 0}}
+        janela = {"dias": [
+            {"dia": 2, "horaInicio": 8, "minutoInicio": 0, "horaFim": 18, "minutoFim": 0},
+            {"dia": 4, "horaInicio": 8, "minutoInicio": 0, "horaFim": 18, "minutoFim": 0},
+            {"dia": 5, "horaInicio": 8, "minutoInicio": 0, "horaFim": 18, "minutoFim": 0},
+        ]}
         for r in conn.execute(text("SELECT value FROM epi_config WHERE key='janela'")):
             janela = json.loads(r.value)
 
@@ -157,14 +168,21 @@ def epi_criar_solicitacao(payload: NovaSolicitacaoEpi):
             if not item.qtd or item.qtd <= 0:
                 continue
             if eh_teste:
-                # motivo teste: item livre, sem catálogo nem controle de estoque
+                # motivo teste: item precisa existir no catálogo (código/conta/umb reais), mas sem controle de estoque
+                if not item.codigo:
+                    raise HTTPException(400, "Selecione um item da lista de sugestões (mesmo em modo teste, o item precisa estar cadastrado).")
+                row = conn.execute(text(
+                    "SELECT descricao, umb, codigo_conta, nome_conta FROM epi_itens WHERE codigo = :cod"
+                ), {"cod": item.codigo}).fetchone()
+                if not row:
+                    raise HTTPException(400, f"Item {item.codigo} não encontrado no catálogo. Escolha um item da lista de sugestões.")
                 itens_resp.append({
-                    "codigo": item.codigo or "", "descricao": item.descricao or "(item de teste)",
-                    "qtd": item.qtd, "codigoConta": "", "nomeConta": "",
+                    "codigo": item.codigo, "descricao": row.descricao, "umb": row.umb,
+                    "qtd": item.qtd, "codigoConta": row.codigo_conta, "nomeConta": row.nome_conta,
                 })
             else:
                 row = conn.execute(text(
-                    "SELECT descricao, saldo, codigo_conta, nome_conta FROM epi_itens WHERE codigo = :cod FOR UPDATE"
+                    "SELECT descricao, umb, saldo, codigo_conta, nome_conta FROM epi_itens WHERE codigo = :cod FOR UPDATE"
                 ), {"cod": item.codigo}).fetchone()
                 if not row:
                     continue
@@ -176,7 +194,7 @@ def epi_criar_solicitacao(payload: NovaSolicitacaoEpi):
                     "UPDATE epi_itens SET saldo = :novo WHERE codigo = :cod"
                 ), {"novo": saldo_depois, "cod": item.codigo})
                 itens_resp.append({
-                    "codigo": item.codigo, "descricao": row.descricao, "qtd": item.qtd,
+                    "codigo": item.codigo, "descricao": row.descricao, "umb": row.umb, "qtd": item.qtd,
                     "codigoConta": row.codigo_conta, "nomeConta": row.nome_conta,
                 })
 
@@ -229,7 +247,7 @@ def epi_salvar_janela(body: JanelaEpi):
 
 @app.get("/api/epi/solicitacoes/{sol_id}/pdf")
 def epi_gerar_pdf(sol_id: str):
-    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.pagesizes import A4, landscape
     from reportlab.lib.units import cm
     from reportlab.lib import colors
     from reportlab.platypus import Table, TableStyle
@@ -249,8 +267,8 @@ def epi_gerar_pdf(sol_id: str):
     CINZA_HEADER = colors.HexColor("#D9E1F2")
 
     buf = BytesIO()
-    c = canvas.Canvas(buf, pagesize=A4)
-    largura, altura = A4
+    c = canvas.Canvas(buf, pagesize=landscape(A4))
+    largura, altura = landscape(A4)
     margem = 1.6*cm
 
     # ---- cabeçalho azul com marca "frosty" ----
@@ -293,11 +311,11 @@ def epi_gerar_pdf(sol_id: str):
     data = [["ITEM", "CÓDIGO", "DESCRIÇÃO DO MATERIAL", "UMB", "QNTD", "COD CONTA", "ATENDIDA"]]
     for i, it in enumerate(itens, start=1):
         data.append([
-            str(i), it.get("codigo") or "-", (it.get("descricao") or "")[:55],
+            str(i), it.get("codigo") or "-", (it.get("descricao") or "")[:80],
             it.get("umb") or "-", str(it.get("qtd")), it.get("codigoConta") or "-", "S (   )   N (   )"
         ])
 
-    col_widths = [1.1*cm, 2.4*cm, 7.3*cm, 1.4*cm, 1.4*cm, 2.6*cm, 3.0*cm]
+    col_widths = [1.2*cm, 2.6*cm, 12.5*cm, 1.6*cm, 1.6*cm, 3.0*cm, 3.6*cm]
     tbl = Table(data, colWidths=col_widths)
     tbl.setStyle(TableStyle([
         ('BACKGROUND', (0,0), (-1,0), CINZA_HEADER),
@@ -335,6 +353,47 @@ def epi_gerar_pdf(sol_id: str):
     })
 
 
+@app.post("/api/epi/itens/importar")
+async def epi_importar_itens(file: UploadFile):
+    import openpyxl
+    from io import BytesIO
+
+    conteudo = await file.read()
+    try:
+        wb = openpyxl.load_workbook(BytesIO(conteudo), data_only=True)
+    except Exception:
+        raise HTTPException(400, "Não consegui abrir o arquivo. Confirme que é um .xlsx válido.")
+
+    ws = wb[wb.sheetnames[0]]  # usa a primeira aba, mesmo formato do Cadastro_dos_itens.xlsx / ESTOQUE.xlsx
+    rows = list(ws.iter_rows(min_row=2, values_only=True))
+
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM epi_itens"))  # substitui o catálogo inteiro, igual ao dos secos
+        total = 0
+        for r in rows:
+            if not r or r[0] is None:
+                continue
+            conn.execute(text(
+                "INSERT INTO epi_itens (codigo, descricao, saldo, umb, nome_conta, codigo_conta, familia, deposito, custo_unitario) "
+                "VALUES (:codigo,:descricao,:saldo,:umb,:nomeConta,:codigoConta,:familia,:deposito,:custoUnitario) "
+                "ON CONFLICT (codigo) DO UPDATE SET descricao=:descricao, saldo=:saldo, umb=:umb, nome_conta=:nomeConta, "
+                "codigo_conta=:codigoConta, familia=:familia, deposito=:deposito, custo_unitario=:custoUnitario"
+            ), {
+                "codigo": str(r[0]).strip(),
+                "descricao": (r[1] or "").strip() if r[1] else "",
+                "saldo": r[2] if r[2] is not None else 0,
+                "umb": r[3] or "UN",
+                "nomeConta": (r[4] or "").strip() if r[4] else "",
+                "codigoConta": (r[5] or "").strip() if r[5] else "",
+                "familia": (r[6] or "").strip() if r[6] else "",
+                "deposito": str(r[7]) if r[7] is not None else "",
+                "custoUnitario": r[8] if r[8] is not None else 0,
+            })
+            total += 1
+
+    return {"ok": True, "itens_importados": total}
+
+
 @app.get("/api/epi/seed-inicial")
 def epi_seed_inicial():
     from epi_seed_data import EPI_SETORES_SEED, EPI_ITENS_SEED
@@ -357,7 +416,11 @@ def epi_seed_inicial():
 
         conn.execute(text(
             "INSERT INTO epi_config (key, value) VALUES ('janela', :v) ON CONFLICT (key) DO NOTHING"
-        ), {"v": json.dumps({"inicio": {"dia": 1, "hora": 8, "minuto": 0}, "fim": {"dia": 3, "hora": 18, "minuto": 0}})})
+        ), {"v": json.dumps({"dias": [
+            {"dia": 2, "horaInicio": 8, "minutoInicio": 0, "horaFim": 18, "minutoFim": 0},
+            {"dia": 4, "horaInicio": 8, "minutoInicio": 0, "horaFim": 18, "minutoFim": 0},
+            {"dia": 5, "horaInicio": 8, "minutoInicio": 0, "horaFim": 18, "minutoFim": 0},
+        ]})})
 
     return {"ok": True, "setores": len(EPI_SETORES_SEED), "itens": len(EPI_ITENS_SEED)}
 
